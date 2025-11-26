@@ -1,0 +1,640 @@
+<?php
+require_once 'header.php';
+
+// Redirect if not a student
+if (getUserRole() !== 'student') {
+    header("Location: librarian_dashboard.php");
+    exit();
+}
+
+function getAccurateTime() {
+    $api_url = 'https://worldtimeapi.org/api/timezone/Asia/Manila';
+    $response = @file_get_contents($api_url);
+
+    if ($response !== false) {
+        $data = json_decode($response, true);
+        if (isset($data['datetime'])) {
+            return new DateTime($data['datetime']);
+        }
+    }
+
+    // Fallback if API fails
+    return new DateTime('now', new DateTimeZone('Asia/Manila'));
+}
+
+// ✅ Library hours check using accurate time
+function isLibraryOpenFromAPI() {
+    $ph_time = getAccurateTime();
+    $current_time = $ph_time->format('H:i');
+    $current_day = $ph_time->format('N'); // 1 (Mon) to 7 (Sun)
+
+    // Weekdays: 8:00 AM - 5:00 PM
+    if ($current_day >= 1 && $current_day <= 5) {
+        return ($current_time >= '08:00' && $current_time < '17:00');
+    }
+    // Weekends: 8:00 AM - 2:00 PM
+    else {
+        return ($current_time >= '08:00' && $current_time < '14:00');
+    }
+}
+
+// ✅ Use accurate API-based check
+$ph_time = getAccurateTime();
+$current_ph_time = $ph_time->format('Y-m-d H:i:s');
+$is_library_open = isLibraryOpenFromAPI();
+
+$library_message = '';
+
+if (!$is_library_open) {
+    $current_day = $ph_time->format('N');
+
+    if ($current_day >= 1 && $current_day <= 5) {
+        $library_message = "Library is currently CLOSED. It opens Monday to Friday, 8:00 AM - 5:00 PM.";
+    } else {
+        $library_message = "Library is currently CLOSED. It opens Saturday to Sunday, 8:00 AM - 2:00 PM.";
+    }
+
+    // 🔔 Popup alert remains
+    echo "<script>
+        alert('📚 The library is closed right now. Please come back during operating hours.');
+    </script>";
+}
+
+$book_id = $quantity = $due_date = "";
+$book_id_err = $quantity_err = $due_date_err = $borrow_err = "";
+$user_id = $_SESSION['user_id']; // Changed from student_id to user_id
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    // Check if library is open before processing
+    if (!$is_library_open) {
+        $borrow_err = "Library is currently closed. You can only borrow books during library hours.";
+    } else {
+        // Validate book selection
+        if (empty(trim($_POST["book_id"]))) {
+            $book_id_err = "Please select a book.";
+        } else {
+            $book_id = trim($_POST["book_id"]);
+        }
+
+        // Validate quantity
+        if (empty(trim($_POST["quantity"])) || !is_numeric($_POST["quantity"]) || $_POST["quantity"] < 1) {
+            $quantity_err = "Please enter a valid quantity (at least 1).";
+        } else {
+            $quantity = trim($_POST["quantity"]);
+        }
+
+        // Validate due date
+        if (empty(trim($_POST["due_date"]))) {
+            $due_date_err = "Please select a due date.";
+        } else {
+            $due_date = trim($_POST["due_date"]);
+            if (strtotime($due_date) < strtotime(date('Y-m-d'))) {
+                $due_date_err = "Due date cannot be in the past.";
+            }
+        }
+
+        // Check input errors before processing
+        if (empty($book_id_err) && empty($quantity_err) && empty($due_date_err)) {
+            // Check if user has outstanding penalties (simplified check) - FIXED: using user_id instead of student_id
+            $penalty_check_sql = "SELECT COUNT(*) FROM penalties p JOIN loans l ON p.loan_id = l.loan_id WHERE l.user_id = ? AND p.status = 'pending'";
+            if ($stmt_penalty = $conn->prepare($penalty_check_sql)) {
+                $stmt_penalty->bind_param("i", $user_id);
+                $stmt_penalty->execute();
+                $stmt_penalty->bind_result($pending_penalties);
+                $stmt_penalty->fetch();
+                $stmt_penalty->close();
+
+                if ($pending_penalties > 0) {
+                    $borrow_err = "You have outstanding penalties. Please clear them before borrowing new books.";
+                }
+            }
+
+            if (empty($borrow_err)) {
+                // Check book availability
+                $sql_check_qty = "SELECT title, quantity_available FROM books WHERE book_id = ?";
+                if ($stmt_check_qty = $conn->prepare($sql_check_qty)) {
+                    $stmt_check_qty->bind_param("i", $book_id);
+                    $stmt_check_qty->execute();
+                    $stmt_check_qty->bind_result($book_title, $available_qty);
+                    $stmt_check_qty->fetch();
+                    $stmt_check_qty->close();
+
+                    if ($available_qty >= $quantity) {
+                        // Update book quantity
+                        $sql_update_book = "UPDATE books SET quantity_available = quantity_available - ? WHERE book_id = ?";
+                        if ($stmt_update_book = $conn->prepare($sql_update_book)) {
+                            $stmt_update_book->bind_param("ii", $quantity, $book_id);
+                            $stmt_update_book->execute();
+                            $stmt_update_book->close();
+
+                            // Record the loan - FIXED: using user_id instead of student_id
+                            $sql_insert_loan = "INSERT INTO loans (user_id, book_id, borrow_date, due_date, status) VALUES (?, ?, CURDATE(), ?, 'borrowed')";
+                            if ($stmt_insert_loan = $conn->prepare($sql_insert_loan)) {
+                                $stmt_insert_loan->bind_param("iis", $user_id, $book_id, $due_date);
+                                if ($stmt_insert_loan->execute()) {
+                                    logAudit($user_id, 'borrow_book', $book_id, 'Borrowed ' . $quantity . ' copies of ' . $book_title);
+                                    echo "<script>
+                                        Swal.fire({
+                                            icon: 'success',
+                                            title: 'Book Borrowed Successfully!',
+                                            html: '<div style=\"text-align: left;\"><h3 style=\"color: #10b981; margin-bottom: 15px;\'>🎉 Borrowing Confirmed!</h3><p><strong>Book:</strong> " . htmlspecialchars($book_title) . "</p><p><strong>Quantity:</strong> " . $quantity . " copy/copies</p><p><strong>Due Date:</strong> " . $due_date . "</p><p style=\"margin-top: 15px; padding: 10px; background: #f0fdf4; border-radius: 8px; border-left: 4px solid #10b981;\"><i data-lucide=\"info\"></i> Please return the book on or before the due date to avoid penalties.</p></div>',
+                                            confirmButtonText: 'View My Loans',
+                                            showCancelButton: true,
+                                            cancelButtonText: 'Borrow Another',
+                                            confirmButtonColor: '#10b981',
+                                            cancelButtonColor: '#6b7280',
+                                            background: 'linear-gradient(135deg, #f0fdf4, #d1fae5)',
+                                            customClass: {
+                                                popup: 'animated pulse'
+                                            }
+                                        }).then((result) => {
+                                            if (result.isConfirmed) {
+                                                window.location.href = 'my_loans.php';
+                                            } else {
+                                                // Reset form
+                                                document.getElementById('book-search').value = '';
+                                                document.getElementById('selected-book-id').value = '';
+                                                document.getElementById('borrow-quantity').value = '1';
+                                                document.getElementById('due-date').value = '';
+                                                document.getElementById('book-preview').classList.remove('active');
+                                                updateFormSteps(1);
+                                            }
+                                        });
+                                    </script>";
+                                } else {
+                                    $borrow_err = "Error recording loan: " . $stmt_insert_loan->error;
+                                }
+                                $stmt_insert_loan->close();
+                            }
+                        } else {
+                            $borrow_err = "Error updating book quantity: " . $stmt_update_book->error;
+                        }
+                    } else {
+                        $borrow_err = "Not enough copies available. Only " . $available_qty . " left.";
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Fetch all books for the autocomplete/dropdown
+$all_books = $conn->query("SELECT book_id, title, quantity_available FROM books WHERE quantity_available > 0 ORDER BY title ASC")->fetch_all(MYSQLI_ASSOC);
+?>
+
+<link rel="stylesheet" href="borrow.css">
+
+<!-- Library Closed Popup -->
+<?php if (!$is_library_open): ?>
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        Swal.fire({
+            icon: 'warning',
+            title: 'Library Closed',
+            html: `<?php echo $library_message; ?><br><br>
+                   <small>Current Philippines Time: <?php echo $current_ph_time; ?></small><br><br>
+                   <div style="text-align: left; background: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ffc107;">
+                       <strong>⚠️ Services Unavailable:</strong>
+                       <ul style="margin: 10px 0 0 0; padding-left: 20px;">
+                           <li>Book Borrowing</li>
+                           <li>Book Returns</li>
+                           <li>Loan Renewals</li>
+                           <li>Penalty Payments</li>
+                       </ul>
+                   </div>`,
+            confirmButtonColor: '#FFC107',
+            confirmButtonText: 'I Understand',
+            backdrop: true,
+            allowOutsideClick: false,
+            allowEscapeKey: false
+        });
+    });
+</script>
+<?php endif; ?>
+
+<div class="borrow-container">
+    <!-- Library Status Banner -->
+    <div class="library-status-banner <?php echo $is_library_open ? 'open' : 'closed'; ?>">
+        <div class="status-indicator">
+            <i data-lucide="<?php echo $is_library_open ? 'door-open' : 'door-closed'; ?>" class="status-icon"></i>
+            <span class="status-text">
+                Library is <?php echo $is_library_open ? 'OPEN' : 'CLOSED'; ?>
+            </span>
+        </div>
+        <div class="status-details">
+            <?php if ($is_library_open): ?>
+                <span class="hours">Weekdays: 8:00 AM - 5:00 PM | Weekends: 8:00 AM - 2:00 PM</span>
+            <?php else: ?>
+                <span class="hours"><?php echo $library_message; ?></span>
+            <?php endif; ?>
+            <span class="current-time">PH Time: <?php echo $current_ph_time; ?></span>
+        </div>
+    </div>
+
+    <div class="borrow-content">
+        <div class="borrow-header">
+            <i data-lucide="library-big" class="header-icon"></i>
+            <h2>Borrow a Book</h2>
+            <p>Discover and borrow from our extensive collection of books</p>
+        </div>
+
+        <div class="borrow-form">
+            <!-- Progress Steps -->
+            <div class="form-steps">
+                <div class="step active" id="step-1">
+                    <div class="step-circle">1</div>
+                    <div class="step-label">Select Book</div>
+                </div>
+                <div class="step" id="step-2">
+                    <div class="step-circle">2</div>
+                    <div class="step-label">Choose Quantity</div>
+                </div>
+                <div class="step" id="step-3">
+                    <div class="step-circle">3</div>
+                    <div class="step-label">Set Due Date</div>
+                </div>
+                <div class="step" id="step-4">
+                    <div class="step-circle">4</div>
+                    <div class="step-label">Confirm</div>
+                </div>
+            </div>
+
+            <?php if (!empty($borrow_err)): ?>
+                <div class="alert alert-danger">
+                    <i data-lucide="alert-triangle" class="alert-icon"></i>
+                    <?php echo $borrow_err; ?>
+                </div>
+            <?php endif; ?>
+
+            <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post" id="borrowForm">
+                <!-- Book Search -->
+                <div class="form-group">
+                    <label for="book-search" class="form-label">
+                        <i data-lucide="search" class="form-label-icon"></i>
+                        Search Book
+                    </label>
+                    <div class="autocomplete-container">
+                        <input type="text" id="book-search" placeholder="Type book title to search..." class="form-input <?php echo (!empty($book_id_err)) ? 'is-invalid' : ''; ?>" required <?php echo !$is_library_open ? 'disabled' : ''; ?>>
+                        <input type="hidden" name="book_id" id="selected-book-id" class="<?php echo (!empty($book_id_err)) ? 'is-invalid' : ''; ?>">
+                        <div id="autocomplete-list" class="autocomplete-items"></div>
+                        <span class="invalid-feedback">
+                            <i data-lucide="alert-circle"></i>
+                            <?php echo $book_id_err; ?>
+                        </span>
+                    </div>
+                    
+                    <!-- Book Preview -->
+                    <div id="book-preview" class="book-preview">
+                        <div class="preview-title" id="preview-title"></div>
+                        <div class="preview-meta">
+                            <span id="preview-availability">
+                                <i data-lucide="package" class="meta-icon"></i>
+                                <span id="availability-text"></span>
+                            </span>
+                            <span id="preview-id">
+                                <i data-lucide="hash" class="meta-icon"></i>
+                                <span id="id-text"></span>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Quantity -->
+                <div class="form-group">
+                    <label class="form-label">
+                        <i data-lucide="package" class="form-label-icon"></i>
+                        Quantity
+                    </label>
+                    <div class="quantity-container">
+                        <button type="button" class="quantity-btn" id="decrease-qty" <?php echo !$is_library_open ? 'disabled' : ''; ?>>-</button>
+                        <input type="number" name="quantity" id="borrow-quantity" min="1" max="10" class="form-input quantity-input <?php echo (!empty($quantity_err)) ? 'is-invalid' : ''; ?>" value="<?php echo $quantity ?: '1'; ?>" required <?php echo !$is_library_open ? 'disabled' : ''; ?>>
+                        <button type="button" class="quantity-btn" id="increase-qty" <?php echo !$is_library_open ? 'disabled' : ''; ?>>+</button>
+                    </div>
+                    <span class="invalid-feedback">
+                        <i data-lucide="alert-circle"></i>
+                        <?php echo $quantity_err; ?>
+                    </span>
+                </div>
+
+                <!-- Due Date -->
+                <div class="form-group">
+                    <label for="due-date" class="form-label">
+                        <i data-lucide="calendar" class="form-label-icon"></i>
+                        Due Date
+                    </label>
+                    <div class="date-input-container">
+                        <input type="date" name="due_date" id="due-date" class="form-input <?php echo (!empty($due_date_err)) ? 'is-invalid' : ''; ?>" value="<?php echo $due_date; ?>" required <?php echo !$is_library_open ? 'disabled' : ''; ?>>
+                        <i data-lucide="calendar" class="calendar-icon"></i>
+                    </div>
+                    <span class="invalid-feedback">
+                        <i data-lucide="alert-circle"></i>
+                        <?php echo $due_date_err; ?>
+                    </span>
+                </div>
+
+                <!-- Submit Button -->
+                <div class="form-group">
+                    <button type="submit" class="btn-submit" id="submit-btn" <?php echo !$is_library_open ? 'disabled' : ''; ?>>
+                        <i data-lucide="book-check" class="btn-icon"></i>
+                        <?php echo $is_library_open ? 'Borrow Book Now' : 'Borrowing Unavailable (Library Closed)'; ?>
+                    </button>
+                </div>
+            </form>
+
+            <!-- Feature Cards -->
+            <div class="feature-cards">
+                <div class="feature-card">
+                    <i data-lucide="shield-check" class="feature-icon"></i>
+                    <h4>Secure Process</h4>
+                    <p>Your borrowing history is securely recorded and managed</p>
+                </div>
+                <div class="feature-card">
+                    <i data-lucide="clock" class="feature-icon"></i>
+                    <h4>Flexible Duration</h4>
+                    <p>Choose your preferred due date for maximum convenience</p>
+                </div>
+                <div class="feature-card">
+                    <i data-lucide="bell" class="feature-icon"></i>
+                    <h4>Smart Reminders</h4>
+                    <p>Get notified before your books are due for return</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<script>
+    document.addEventListener("DOMContentLoaded", function () {
+        const searchInput = document.getElementById("book-search");
+        const autocompleteList = document.getElementById("autocomplete-list");
+        const selectedBookIdInput = document.getElementById("selected-book-id");
+        const bookPreview = document.getElementById("book-preview");
+        const previewTitle = document.getElementById("preview-title");
+        const availabilityText = document.getElementById("availability-text");
+        const idText = document.getElementById("id-text");
+        const quantityInput = document.getElementById("borrow-quantity");
+        const decreaseBtn = document.getElementById("decrease-qty");
+        const increaseBtn = document.getElementById("increase-qty");
+        const submitBtn = document.getElementById("submit-btn");
+        const dueDateInput = document.getElementById("due-date");
+        const allBooks = <?php echo json_encode($all_books); ?>;
+        const isLibraryOpen = <?php echo $is_library_open ? 'true' : 'false'; ?>;
+
+        console.log('Available books:', allBooks); // Debug log
+
+        // Set minimum due date to tomorrow
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        dueDateInput.min = tomorrow.toISOString().split('T')[0];
+
+        // Update form steps based on user progress
+        function updateFormSteps(step) {
+            document.querySelectorAll('.step').forEach((s, index) => {
+                if (index < step) {
+                    s.classList.add('active');
+                } else {
+                    s.classList.remove('active');
+                }
+            });
+        }
+
+        // Initialize form steps
+        updateFormSteps(1);
+
+        // Book search functionality - only if library is open
+        if (isLibraryOpen) {
+            searchInput.addEventListener("input", function () {
+                const query = searchInput.value.trim().toLowerCase();
+                autocompleteList.innerHTML = "";
+                
+                // Don't clear selected book if user is just typing more
+                if (query.length === 0) {
+                    selectedBookIdInput.value = "";
+                    bookPreview.classList.remove("active");
+                    updateFormSteps(1);
+                }
+
+                if (query.length < 2) return;
+
+                const suggestions = allBooks.filter(book =>
+                    book.title.toLowerCase().includes(query) && book.quantity_available > 0
+                );
+
+                if (suggestions.length === 0) {
+                    const noResults = document.createElement("div");
+                    noResults.innerHTML = `
+                        <div style="text-align: center; padding: 20px; color: #64748b;">
+                            <i data-lucide="book-x" style="width: 32px; height: 32px; margin-bottom: 8px;"></i>
+                            <p style="margin: 0; font-weight: 500;">No books found</p>
+                            <p style="margin: 4px 0 0 0; font-size: 0.9rem;">Try searching with different keywords</p>
+                        </div>
+                    `;
+                    autocompleteList.appendChild(noResults);
+                    autocompleteList.style.display = 'block';
+                    return;
+                }
+
+                suggestions.forEach(book => {
+                    const item = document.createElement("div");
+                    item.className = "book-suggestion";
+                    item.innerHTML = `
+                        <span class="book-title">${book.title}</span>
+                        <span class="book-availability">${book.quantity_available} available</span>
+                    `;
+                    item.addEventListener("click", function () {
+                        console.log('Book selected:', book); // Debug log
+                        searchInput.value = book.title;
+                        selectedBookIdInput.value = book.book_id;
+                        autocompleteList.innerHTML = "";
+                        autocompleteList.style.display = 'none';
+                        
+                        // Show book preview
+                        previewTitle.textContent = book.title;
+                        availabilityText.textContent = `${book.quantity_available} copies available`;
+                        idText.textContent = `ID: ${book.book_id}`;
+                        bookPreview.classList.add("active");
+                        
+                        // Update quantity max and form steps
+                        quantityInput.max = book.quantity_available;
+                        quantityInput.value = Math.min(1, book.quantity_available); // Set to 1 or max available
+                        updateQuantityButtons();
+                        updateFormSteps(2);
+                        
+                        // Animate the preview
+                        bookPreview.style.animation = 'none';
+                        setTimeout(() => {
+                            bookPreview.style.animation = 'slideDown 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
+                        }, 10);
+
+                        // Debug: Check if book ID is properly set
+                        console.log('Selected Book ID:', selectedBookIdInput.value);
+                    });
+                    autocompleteList.appendChild(item);
+                });
+                
+                autocompleteList.style.display = suggestions.length > 0 ? 'block' : 'none';
+            });
+
+            // Close autocomplete when clicking outside
+            document.addEventListener("click", function(e) {
+                if (!searchInput.contains(e.target) && !autocompleteList.contains(e.target)) {
+                    autocompleteList.style.display = 'none';
+                }
+            });
+
+            // Show autocomplete when focusing on search input
+            searchInput.addEventListener("focus", function() {
+                if (searchInput.value.length >= 2) {
+                    autocompleteList.style.display = 'block';
+                }
+            });
+        }
+
+        // Quantity controls - only if library is open
+        function updateQuantityButtons() {
+            if (!isLibraryOpen) return;
+            
+            const currentQty = parseInt(quantityInput.value) || 1;
+            const maxQty = parseInt(quantityInput.max) || 10;
+            
+            decreaseBtn.disabled = currentQty <= 1;
+            increaseBtn.disabled = currentQty >= maxQty;
+            
+            if (currentQty > 0 && selectedBookIdInput.value) {
+                updateFormSteps(3);
+            }
+        }
+
+        if (isLibraryOpen) {
+            decreaseBtn.addEventListener("click", function() {
+                let currentQty = parseInt(quantityInput.value) || 1;
+                if (currentQty > 1) {
+                    quantityInput.value = currentQty - 1;
+                    updateQuantityButtons();
+                }
+            });
+
+            increaseBtn.addEventListener("click", function() {
+                let currentQty = parseInt(quantityInput.value) || 1;
+                const maxQty = parseInt(quantityInput.max) || 10;
+                if (currentQty < maxQty) {
+                    quantityInput.value = currentQty + 1;
+                    updateQuantityButtons();
+                }
+            });
+
+            quantityInput.addEventListener("input", function() {
+                const maxQty = parseInt(this.max) || 10;
+                let currentQty = parseInt(this.value) || 1;
+                
+                if (currentQty > maxQty) {
+                    this.value = maxQty;
+                } else if (currentQty < 1) {
+                    this.value = 1;
+                }
+                
+                updateQuantityButtons();
+            });
+
+            // Due date change
+            dueDateInput.addEventListener('change', function() {
+                if (this.value && selectedBookIdInput.value && quantityInput.value) {
+                    updateFormSteps(4);
+                }
+            });
+
+            // Update buttons on page load
+            updateQuantityButtons();
+        }
+
+        // Form submission with validation
+        document.getElementById("borrowForm").addEventListener("submit", function(e) {
+            // Debug: Check all form values before submission
+            console.log('Form submission values:', {
+                book_id: selectedBookIdInput.value,
+                quantity: quantityInput.value,
+                due_date: dueDateInput.value
+            });
+
+            if (!isLibraryOpen) {
+                e.preventDefault();
+                showLibraryClosedMessage();
+                return;
+            }
+
+            if (!selectedBookIdInput.value) {
+                e.preventDefault();
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Book Not Selected',
+                    text: 'Please select a book from the search results',
+                    confirmButtonColor: '#6366f1'
+                });
+                searchInput.focus();
+                return;
+            }
+
+            if (!quantityInput.value || parseInt(quantityInput.value) < 1) {
+                e.preventDefault();
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Invalid Quantity',
+                    text: 'Please enter a valid quantity (at least 1)',
+                    confirmButtonColor: '#6366f1'
+                });
+                quantityInput.focus();
+                return;
+            }
+
+            if (!dueDateInput.value) {
+                e.preventDefault();
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Due Date Required',
+                    text: 'Please select a due date for your book',
+                    confirmButtonColor: '#6366f1'
+                });
+                dueDateInput.focus();
+                return;
+            }
+
+            // Show loading state
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<div class="loading-spinner"></div> Processing Your Request...';
+        });
+
+        // Show library closed message
+        function showLibraryClosedMessage() {
+            Swal.fire({
+                icon: 'warning',
+                title: 'Library Closed',
+                html: 'Book borrowing is only available during library hours.<br><br><strong>Library Hours:</strong><br>Weekdays: 8:00 AM - 5:00 PM<br>Weekends: 8:00 AM - 2:00 PM<br><br><small>All times are in Philippines Time</small>',
+                confirmButtonColor: '#FFC107',
+                confirmButtonText: 'I Understand'
+            });
+        }
+
+        // Update time display
+        fetch('https://worldtimeapi.org/api/timezone/Asia/Manila')
+            .then(response => response.json())
+            .then(data => {
+                const now = new Date(data.datetime);
+                document.querySelector('.current-time').textContent = 
+                    'PH Time: ' + now.toLocaleString();
+            })
+            .catch(() => {
+                // fallback if API fails
+                console.log('Using fallback PHP time.');
+            });
+
+        // Initialize Lucide icons
+        if (typeof lucide !== 'undefined') {
+            lucide.createIcons();
+        }
+    });
+</script>
+<?php include 'ai_chat_component.php'; ?>
+<?php
+require_once 'footer.php';
+?>
